@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""
+SD-WAN Code Upgrade Script
+Monitors routers via ping and upgrades to 17.15.04c.0.107 when reachable.
+"""
+
+import re
+import os
+import json
+import time
+import threading
+import getpass
+import subprocess
+import sys
+from datetime import datetime
+
+import paramiko
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+PING_FILE       = "/mnt/c/Users/nick.oneill/Tools/multiping/pingips.txt"
+TARGET_VERSION  = "17.15.04c.0.107"
+OLD_VERSION     = "17.12.05a.0.159"
+INSTALL_FILE    = "bootflash:c1100-universalk9.17.15.04c.SPA.bin"
+UP_THRESHOLD    = 30          # seconds device must be Up before upgrade starts
+PING_INTERVAL   = 5           # seconds between pings
+RETRY_DELAY     = 300         # seconds before retrying a failed device (5 min)
+SSH_TIMEOUT     = 30          # seconds for SSH connect/read
+CMD_TIMEOUT     = 600         # seconds to wait for long-running commands
+REBOOT_TIMEOUT  = 600         # seconds to wait for device to come back after reboot
+REBOOT_POLL     = 10          # seconds between reboot connectivity checks
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATUS_FILE = os.path.join(_SCRIPT_DIR, "upgrade_status.json")
+
+
+# ── Credentials (populated at startup) ────────────────────────────────────────
+local_user = ""
+local_pass = ""
+ise_user   = ""
+ise_pass   = ""
+
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+ping_results: dict[str, str]    = {}          # ip -> "Up" | "Down"
+up_since:     dict[str, float]  = {}          # ip -> epoch when first Up
+completed:      dict[str, str]   = {}          # ip -> final status label
+checking:       set[str]         = set()       # IPs currently checking version
+checking_since: dict[str, float] = {}          # ip -> epoch when checking started
+in_progress:      set[str]       = set()       # IPs actively being upgraded
+in_progress_since: dict[str, float] = {}       # ip -> epoch when upgrade started
+retry_queue:  dict[str, float]  = {}          # ip -> epoch when retry is due
+hostnames:    dict[str, str]    = {}          # ip -> discovered hostname
+state_lock    = threading.Lock()
+print_lock    = threading.Lock()
+_log_file     = None   # opened in main()
+
+
+# ── Status file ───────────────────────────────────────────────────────────────────
+
+def save_status() -> None:
+    """
+    Write current device state to STATUS_FILE as JSON.
+    Uses a temp-file + atomic rename so the file is never half-written.
+    """
+    now_str = datetime.now().isoformat(timespec='seconds')
+    with state_lock:
+        all_ips = (
+            set(ping_results.keys())
+            | set(completed.keys())
+            | set(retry_queue.keys())
+            | in_progress
+            | checking
+        )
+        devices = {}
+        for ip in sorted(all_ips):
+            if ip in completed:
+                devices[ip] = {"status": "complete", "label": completed[ip]}
+            elif ip in retry_queue:
+                devices[ip] = {"status": "retry", "retry_until": retry_queue[ip]}
+            elif ip in in_progress:
+                devices[ip] = {"status": "upgrading"}
+            elif ip in checking:
+                devices[ip] = {"status": "checking"}
+            else:
+                devices[ip] = {"status": "pending"}
+            devices[ip]["last_updated"] = now_str
+            if ip in hostnames:
+                devices[ip]["hostname"] = hostnames[ip]
+
+    data = {"last_updated": now_str, "devices": devices}
+    tmp = STATUS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, STATUS_FILE)
+    except Exception as exc:
+        print(f"WARNING: Could not write status file: {exc}")
+
+
+def load_status(ips: list[str]) -> None:
+    """
+    Load STATUS_FILE and restore completed / retry state.
+    Interrupted upgrades (upgrading/checking) are left as pending so the
+    version-check logic can determine the correct resume point.
+    """
+    if not os.path.exists(STATUS_FILE):
+        return
+
+    try:
+        with open(STATUS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        print(f"WARNING: Could not read status file ({STATUS_FILE}): {exc}")
+        return
+
+    devices = data.get("devices", {})
+    now     = time.time()
+    msgs    = []
+
+    for ip in ips:
+        entry = devices.get(ip)
+        if not entry:
+            continue
+        status = entry.get("status")
+
+        if status == "complete":
+            label = entry.get("label", "COMPLETE")
+            completed[ip] = label
+            hostname = entry.get("hostname", "")
+            if hostname:
+                hostnames[ip] = hostname
+            msgs.append(f"  {ip:<20}  {hostname:<30}  {label} (skipping)")
+
+        elif status == "retry":
+            retry_until = entry.get("retry_until", 0.0)
+            if retry_until > now:
+                retry_queue[ip] = retry_until
+                remaining = int(retry_until - now)
+                msgs.append(f"  {ip:<20}  {'':30}  RETRY in {fmt_elapsed(remaining)} (restored)")
+            else:
+                msgs.append(f"  {ip:<20}  {'':30}  retry expired, re-queuing as pending")
+
+        elif status in ("upgrading", "checking", "interrupted"):
+            msgs.append(f"  {ip:<20}  was {status} — will re-check version and resume")
+
+    if msgs:
+        print(f"Loaded status from {STATUS_FILE}:")
+        for m in msgs:
+            print(m)
+        print()
+
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def fmt_elapsed(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m {seconds % 60:02d}s"
+
+
+def parse_sdwan_versions(output: str) -> dict:
+    """
+    Parse 'show sdwan software' table output.
+    Returns: { version_str: {'active': bool, 'default': bool}, ... }
+    Data rows have 'true' or 'false' in column positions 1 and 2.
+    """
+    versions = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if (
+            len(parts) >= 3
+            and parts[1].lower() in ('true', 'false')
+            and parts[2].lower() in ('true', 'false')
+        ):
+            versions[parts[0]] = {
+                'active':  parts[1].lower() == 'true',
+                'default': parts[2].lower() == 'true',
+            }
+    return versions
+
+
+def log(ip: str, msg: str) -> None:
+    line = f"[{ts()}] [{ip}] {msg}"
+    with print_lock:
+        print(line)
+        if _log_file:
+            _log_file.write(line + "\n")
+            _log_file.flush()
+
+
+def prompt_credentials() -> None:
+    global local_user, local_pass, ise_user, ise_pass
+    print("=== SD-WAN Code Upgrade Tool ===\n")
+    local_user = input("Local username: ").strip()
+    local_pass = getpass.getpass("Local password: ")
+    print()
+    ise_user   = input("ISE username: ").strip()
+    ise_pass   = getpass.getpass("ISE password: ")
+    print()
+
+
+def extract_172_ips(filepath: str) -> list[str]:
+    """Read the file and return unique IPv4 addresses with first octet 172."""
+    pattern = re.compile(r"\b(172\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+    seen = []
+    seen_set = set()
+    try:
+        with open(filepath, "r", errors="replace") as fh:
+            for line in fh:
+                for match in pattern.finditer(line):
+                    ip = match.group(1)
+                    if ip not in seen_set:
+                        seen_set.add(ip)
+                        seen.append(ip)
+    except FileNotFoundError:
+        print(f"ERROR: Cannot open {filepath}")
+        sys.exit(1)
+    return seen
+
+
+def ping_once(ip: str) -> bool:
+    """Return True if host replies to a single ping."""
+    result = subprocess.run(
+        ["ping", "-c", "1", "-W", "2", ip],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+# ── SSH helpers ───────────────────────────────────────────────────────────────
+
+def ssh_connect(ip: str) -> paramiko.SSHClient:
+    """
+    Try local credentials first; fall back to ISE credentials.
+    Returns an open SSHClient or raises an exception.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    for user, passwd, label in [
+        (local_user, local_pass, "local"),
+        (ise_user,   ise_pass,   "ISE"),
+    ]:
+        try:
+            client.connect(
+                ip,
+                username=user,
+                password=passwd,
+                timeout=SSH_TIMEOUT,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(10)  # send keepalive every 10 s
+            log(ip, f"SSH connected using {label} credentials")
+            return client
+        except paramiko.AuthenticationException:
+            log(ip, f"SSH auth failed with {label} credentials")
+        except Exception as exc:
+            log(ip, f"SSH connect error ({label}): {exc}")
+            raise
+
+    raise RuntimeError(f"All credential sets failed for {ip}")
+
+
+def discover_hostname(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClient:
+    """
+    Fetch the device hostname via 'show version | include uptime' using the
+    safe run_command wrapper and store it in the hostnames dict.
+    Never raises — hostname is optional.
+    """
+    try:
+        client, hn_output = run_command(
+            client, ip, "show version | include uptime", timeout=SSH_TIMEOUT
+        )
+        line = hn_output.strip().splitlines()[0] if hn_output.strip() else ""
+        hostname = line.split(" uptime")[0].strip() if " uptime" in line else ""
+        if hostname:
+            with state_lock:
+                hostnames[ip] = hostname
+            log(ip, f"Hostname: {hostname}")
+    except Exception:
+        pass
+    return client
+
+
+def run_command(client: paramiko.SSHClient, ip: str, command: str,
+                timeout: int = CMD_TIMEOUT) -> tuple[paramiko.SSHClient, str]:
+    """
+    Execute a command and return (client, output).
+    If the SSH transport has dropped, reconnects automatically before running.
+    """
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        log(ip, "SSH transport inactive — reconnecting before command")
+        try:
+            client.close()
+        except Exception:
+            pass
+        client = ssh_connect(ip)
+
+    log(ip, f"CMD: {command}")
+    _, stdout, stderr = client.exec_command(command, timeout=timeout)
+    output = stdout.read().decode(errors="replace")
+    err    = stderr.read().decode(errors="replace")
+    if err.strip():
+        log(ip, f"STDERR: {err.strip()}")
+    return client, output
+
+
+def wait_for_reboot(ip: str) -> bool:
+    """
+    Wait until the device responds to ping again after a reboot.
+    Returns True if it came back within REBOOT_TIMEOUT, False otherwise.
+    """
+    log(ip, "Waiting for device to go offline (reboot initiated)…")
+    deadline = time.time() + REBOOT_TIMEOUT
+
+    # Wait for it to go down first
+    down_seen = False
+    while time.time() < deadline:
+        if not ping_once(ip):
+            down_seen = True
+            log(ip, "Device is offline (rebooting)…")
+            break
+        time.sleep(REBOOT_POLL)
+
+    if not down_seen:
+        log(ip, "WARNING: Device never went offline — may not have rebooted")
+
+    # Wait for it to come back
+    log(ip, "Waiting for device to come back online…")
+    while time.time() < deadline:
+        if ping_once(ip):
+            log(ip, "Device is back online")
+            return True
+        time.sleep(REBOOT_POLL)
+
+    log(ip, "ERROR: Device did not come back within timeout")
+    return False
+
+
+# ── Upgrade task (runs in its own thread) ─────────────────────────────────────
+
+def upgrade_device(ip: str) -> None:
+    """Full upgrade workflow for a single device."""
+    log(ip, "=== Starting upgrade workflow ===")
+
+    def fail(reason: str) -> None:
+        log(ip, f"FAILED: {reason} — queuing for retry in 5 minutes")
+        with state_lock:
+            checking.discard(ip)
+            checking_since.pop(ip, None)
+            in_progress.discard(ip)
+            in_progress_since.pop(ip, None)
+            retry_queue[ip] = time.time() + RETRY_DELAY
+        save_status()
+
+    # ── Step 1: SSH connect ────────────────────────────────────────────────────
+    try:
+        client = ssh_connect(ip)
+    except Exception as exc:
+        fail(f"SSH connect: {exc}")
+        return
+
+    try:
+        # ── Step 2: Parse version table ───────────────────────────────────────
+        # Discover hostname first (uses run_command — safe for IOS-XE)
+        if ip not in hostnames:
+            client = discover_hostname(client, ip)
+
+        log(ip, "Checking active software version…")
+        client, output = run_command(client, ip, "show sdwan software")
+        log(ip, f"show sdwan software output:\n{output.strip()}")
+
+        versions    = parse_sdwan_versions(output)
+        target      = versions.get(TARGET_VERSION, {})
+        is_active   = target.get('active',  False)
+        is_default  = target.get('default', False)
+        is_installed = TARGET_VERSION in versions
+
+        if is_active and is_default:
+            log(ip, f"Already running {TARGET_VERSION} as active+default — no upgrade needed")
+            with state_lock:
+                completed[ip] = "ALREADY UP TO DATE"
+                checking.discard(ip)
+                checking_since.pop(ip, None)
+            save_status()
+            client.close()
+            return
+
+        # Needs work — transition to in_progress
+        with state_lock:
+            checking.discard(ip)
+            checking_since.pop(ip, None)
+            in_progress.add(ip)
+            in_progress_since[ip] = time.time()
+        save_status()
+
+        if is_active and not is_default:
+            # Active but set-default / remove not yet done — jump to step 7
+            log(ip, f"{TARGET_VERSION} is active but not default — resuming at set-default")
+
+        elif is_installed and not is_active:
+            # Installed but activate not yet done — jump to step 5
+            log(ip, f"{TARGET_VERSION} is installed but not active — resuming at activate")
+
+            # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            log(ip, f"Activating {TARGET_VERSION} (device will reboot)…")
+            activate_cmd = (
+                f"request platform software sdwan software activate {TARGET_VERSION}"
+            )
+            try:
+                client, activate_output = run_command(
+                    client, ip, activate_cmd, timeout=CMD_TIMEOUT
+                )
+                log(ip, f"Activate output:\n{activate_output.strip()}")
+            except Exception:
+                log(ip, "Connection dropped (expected during reboot)")
+            finally:
+                client.close()
+
+            # ── Step 6: Wait for reboot ───────────────────────────────────────
+            if not wait_for_reboot(ip):
+                fail("Device did not return after activate reboot")
+                return
+            log(ip, "Waiting 60s for SSH daemon to restart…")
+            time.sleep(60)
+
+        else:
+            # ── Step 3: Check file exists on bootflash ────────────────────────
+            log(ip, f"Checking {INSTALL_FILE} on bootflash…")
+            client, dir_output = run_command(
+                client, ip, f"dir {INSTALL_FILE}", timeout=SSH_TIMEOUT
+            )
+            file_missing = (
+                "No such file" in dir_output
+                or "Error"      in dir_output
+                or "error"      in dir_output
+            )
+
+            if file_missing:
+                # Install may have already run and consumed the bin.
+                log(ip, f"Install file not found — re-checking software table…")
+                client, sw2 = run_command(client, ip, "show sdwan software")
+                log(ip, f"show sdwan software output:\n{sw2.strip()}")
+                versions2 = parse_sdwan_versions(sw2)
+                if TARGET_VERSION not in versions2:
+                    client.close()
+                    fail(f"Install file not found and {TARGET_VERSION} not installed: {INSTALL_FILE}")
+                    return
+                log(ip, f"{TARGET_VERSION} present — bin consumed by prior run, skipping to activate")
+            else:
+                log(ip, "Install file found on bootflash")
+
+                # ── Step 4: Install ───────────────────────────────────────────
+                log(ip, "Installing software (this may take several minutes)…")
+                install_cmd = (
+                    f"request platform software sdwan software install {INSTALL_FILE}"
+                )
+                client, install_output = run_command(client, ip, install_cmd, timeout=CMD_TIMEOUT)
+                log(ip, f"Install output:\n{install_output.strip()}")
+                if "error" in install_output.lower() or "failed" in install_output.lower():
+                    client.close()
+                    fail("Install command reported an error")
+                    return
+
+            # ── Step 5: Activate (triggers reboot) ────────────────────────────
+            log(ip, f"Activating {TARGET_VERSION} (device will reboot)…")
+            activate_cmd = (
+                f"request platform software sdwan software activate {TARGET_VERSION}"
+            )
+            try:
+                client, activate_output = run_command(
+                    client, ip, activate_cmd, timeout=CMD_TIMEOUT
+                )
+                log(ip, f"Activate output:\n{activate_output.strip()}")
+            except Exception:
+                log(ip, "Connection dropped (expected during reboot)")
+            finally:
+                client.close()
+
+            # ── Step 6: Wait for reboot ───────────────────────────────────────
+            if not wait_for_reboot(ip):
+                fail("Device did not return after activate reboot")
+                return
+            log(ip, "Waiting 60s for SSH daemon to restart…")
+            time.sleep(60)
+
+        # ── Step 7: Reconnect and set-default ─────────────────────────────────
+        log(ip, "Reconnecting for set-default…")
+        try:
+            client = ssh_connect(ip)
+        except Exception as exc:
+            fail(f"Reconnect after activate failed: {exc}")
+            return
+
+        log(ip, f"Setting {TARGET_VERSION} as default…")
+        setdef_cmd = (
+            f"request platform software sdwan software set-default {TARGET_VERSION}"
+        )
+        client, setdef_output = run_command(client, ip, setdef_cmd, timeout=CMD_TIMEOUT)
+        log(ip, f"Set-default output:\n{setdef_output.strip()}")
+        client.close()
+
+        # ── Step 8: Remove old version ────────────────────────────────────────
+        time.sleep(10)
+
+        log(ip, "Reconnecting to remove old software…")
+        try:
+            client = ssh_connect(ip)
+        except Exception as exc:
+            fail(f"Reconnect for remove failed: {exc}")
+            return
+
+        log(ip, f"Removing old version {OLD_VERSION}…")
+        remove_cmd = (
+            f"request platform software sdwan software remove {OLD_VERSION}"
+        )
+        client, remove_output = run_command(client, ip, remove_cmd, timeout=CMD_TIMEOUT)
+        log(ip, f"Remove output:\n{remove_output.strip()}")
+        client.close()
+
+        # ── Done ──────────────────────────────────────────────────────────────
+        log(ip, f"=== UPGRADE COMPLETE — {TARGET_VERSION} active+default ===")
+        with state_lock:
+            completed[ip] = "UPGRADE COMPLETE"
+            in_progress.discard(ip)
+            in_progress_since.pop(ip, None)
+        save_status()
+
+    except Exception as exc:
+        try:
+            client.close()
+        except Exception:
+            pass
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        fail(reason)
+
+
+# ── Ping monitor ──────────────────────────────────────────────────────────────
+
+def ping_loop(ips: list[str]) -> None:
+    """Continuously ping all IPs and print a status table every cycle."""
+    while True:
+        now = time.time()
+
+        # Check retry queue
+        with state_lock:
+            due = [ip for ip, t in list(retry_queue.items()) if now >= t]
+            for ip in due:
+                del retry_queue[ip]
+                log(ip, "Retry delay elapsed — re-entering ping monitoring")
+
+        for ip in ips:
+            with state_lock:
+                if ip in completed or ip in in_progress or ip in checking:
+                    continue
+
+            up = ping_once(ip)
+
+            with state_lock:
+                was_up = ping_results.get(ip) == "Up"
+                ping_results[ip] = "Up" if up else "Down"
+
+                if up:
+                    if not was_up:
+                        up_since[ip] = now
+                    elif now - up_since.get(ip, now) >= UP_THRESHOLD:
+                        if ip not in checking and ip not in in_progress and ip not in completed:
+                            checking.add(ip)
+                            checking_since[ip] = now
+                            t = threading.Thread(
+                                target=upgrade_device, args=(ip,), daemon=True
+                            )
+                            t.start()
+                else:
+                    up_since.pop(ip, None)
+
+        # Print status summary
+        print_status(ips, now)
+        time.sleep(PING_INTERVAL)
+
+
+def print_status(ips: list[str], now: float) -> None:
+    with print_lock:
+        print(f"\n{'─'*75}")
+        print(f"  {'IP':<20}  {'HOSTNAME':<30}  STATUS")
+        print(f"{'─'*75}")
+        for ip in ips:
+            with state_lock:
+                if ip in completed:
+                    state = completed[ip]
+                elif ip in in_progress:
+                    elapsed = int(now - in_progress_since.get(ip, now))
+                    state = f"INSTALLING ({fmt_elapsed(elapsed)})"
+                elif ip in checking:
+                    elapsed = int(now - checking_since.get(ip, now))
+                    state = f"CHECKING CODE VERSION ({fmt_elapsed(elapsed)})"
+                elif ip in retry_queue:
+                    remaining = max(0, int(retry_queue[ip] - now))
+                    state = f"RETRY in {remaining}s"
+                else:
+                    status = ping_results.get(ip, "Unknown")
+                    if status == "Up":
+                        held = int(now - up_since.get(ip, now))
+                        state = f"Up ({held}s / {UP_THRESHOLD}s)"
+                    else:
+                        state = status
+            print(f"  {ip:<20}  {hostnames.get(ip, ''):<30}  {state}")
+        print(f"{'─'*75}  [{ts()}]\n")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    global _log_file
+
+    log_path = os.path.join(_SCRIPT_DIR, f"code_upgrade_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    _log_file = open(log_path, "w", buffering=1, encoding="utf-8")
+    print(f"Logging to: {log_path}")
+    print(f"Status file: {STATUS_FILE}\n")
+
+    prompt_credentials()
+
+    ips = extract_172_ips(PING_FILE)
+    if not ips:
+        print(f"No 172.x.x.x addresses found in {PING_FILE}")
+        sys.exit(1)
+
+    # Initialise ping state for all IPs, then overlay saved status
+    for ip in ips:
+        ping_results[ip] = "Down"
+    load_status(ips)
+
+    print(f"Found {len(ips)} target IP(s):\n  " + "\n  ".join(ips))
+    print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")
+
+    try:
+        ping_loop(ips)
+    finally:
+        _log_file.close()
+
+
+if __name__ == "__main__":
+    main()

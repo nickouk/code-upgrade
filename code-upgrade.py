@@ -663,8 +663,12 @@ def main() -> None:
 
     try:
         ping_loop(ips, display_order)
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving status and exiting…")
+        save_status()
     finally:
         _log_file.close()
+        print("Log closed. Goodbye.")
 
 
 if __name__ == "__main__":

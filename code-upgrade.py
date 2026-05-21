@@ -204,23 +204,36 @@ def prompt_credentials() -> None:
     print()
 
 
-def extract_172_ips(filepath: str) -> list[str]:
-    """Read the file and return unique IPv4 addresses with first octet 172."""
+def extract_172_ips(filepath: str) -> tuple[list[str], list[str]]:
+    """
+    Read the file and return:
+      ips          - unique IPv4 addresses with first octet 172 (for processing)
+      display_order - ordered list mixing IPs and comment strings (for display)
+    Comment lines are any line whose first non-whitespace character is '#'.
+    """
     pattern = re.compile(r"\b(172\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
-    seen = []
-    seen_set = set()
+    seen_set: set[str] = set()
+    ips: list[str] = []
+    display_order: list[str] = []   # entries are IPs or "#comment" strings
     try:
         with open(filepath, "r", errors="replace") as fh:
             for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#"):
+                    display_order.append(stripped)
+                    continue
                 for match in pattern.finditer(line):
                     ip = match.group(1)
                     if ip not in seen_set:
                         seen_set.add(ip)
-                        seen.append(ip)
+                        ips.append(ip)
+                        display_order.append(ip)
     except FileNotFoundError:
         print(f"ERROR: Cannot open {filepath}")
         sys.exit(1)
-    return seen
+    return ips, display_order
 
 
 def ping_once(ip: str) -> bool:
@@ -547,7 +560,7 @@ def upgrade_device(ip: str) -> None:
 
 # ── Ping monitor ──────────────────────────────────────────────────────────────
 
-def ping_loop(ips: list[str]) -> None:
+def ping_loop(ips: list[str], display_order: list[str]) -> None:
     """Continuously ping all IPs and print a status table every cycle."""
     while True:
         now = time.time()
@@ -585,16 +598,21 @@ def ping_loop(ips: list[str]) -> None:
                     up_since.pop(ip, None)
 
         # Print status summary
-        print_status(ips, now)
+        print_status(ips, display_order, now)
         time.sleep(PING_INTERVAL)
 
 
-def print_status(ips: list[str], now: float) -> None:
+def print_status(ips: list[str], display_order: list[str], now: float) -> None:
     with print_lock:
         print(f"\n{'─'*75}")
         print(f"  {'IP':<20}  {'HOSTNAME':<30}  STATUS")
         print(f"{'─'*75}")
-        for ip in ips:
+        for entry in display_order:
+            if entry.startswith("#"):
+                # Comment line — display as a section header
+                print(f"  {entry}")
+                continue
+            ip = entry
             with state_lock:
                 if ip in completed:
                     state = completed[ip]
@@ -630,7 +648,7 @@ def main() -> None:
 
     prompt_credentials()
 
-    ips = extract_172_ips(PING_FILE)
+    ips, display_order = extract_172_ips(PING_FILE)
     if not ips:
         print(f"No 172.x.x.x addresses found in {PING_FILE}")
         sys.exit(1)
@@ -644,7 +662,7 @@ def main() -> None:
     print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")
 
     try:
-        ping_loop(ips)
+        ping_loop(ips, display_order)
     finally:
         _log_file.close()
 

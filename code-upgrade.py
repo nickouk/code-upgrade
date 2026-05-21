@@ -617,10 +617,10 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                 if ip in completed:
                     state = completed[ip]
                 elif ip in in_progress:
-                    elapsed = int(now - in_progress_since.get(ip, now))
+                    elapsed = max(0, int(now - in_progress_since.get(ip, now)))
                     state = f"INSTALLING ({fmt_elapsed(elapsed)})"
                 elif ip in checking:
-                    elapsed = int(now - checking_since.get(ip, now))
+                    elapsed = max(0, int(now - checking_since.get(ip, now)))
                     state = f"CHECKING CODE VERSION ({fmt_elapsed(elapsed)})"
                 elif ip in retry_queue:
                     remaining = max(0, int(retry_queue[ip] - now))
@@ -628,7 +628,7 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                 else:
                     status = ping_results.get(ip, "Unknown")
                     if status == "Up":
-                        held = int(now - up_since.get(ip, now))
+                        held = max(0, int(now - up_since.get(ip, now)))
                         state = f"Up ({held}s / {UP_THRESHOLD}s)"
                     else:
                         state = status

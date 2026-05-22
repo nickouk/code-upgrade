@@ -48,8 +48,10 @@ checking:       set[str]         = set()       # IPs currently checking version
 checking_since: dict[str, float] = {}          # ip -> epoch when checking started
 in_progress:      set[str]       = set()       # IPs actively being upgraded
 in_progress_since: dict[str, float] = {}       # ip -> epoch when upgrade started
+in_progress_step:  dict[str, str]  = {}        # ip -> current upgrade step label
 retry_queue:  dict[str, float]  = {}          # ip -> epoch when retry is due
 hostnames:    dict[str, str]    = {}          # ip -> discovered hostname
+device_info:  dict[str, dict]  = {}          # ip -> {config, policy, circuit}
 state_lock    = threading.Lock()
 print_lock    = threading.Lock()
 _log_file     = None   # opened in main()
@@ -86,6 +88,8 @@ def save_status() -> None:
             devices[ip]["last_updated"] = now_str
             if ip in hostnames:
                 devices[ip]["hostname"] = hostnames[ip]
+            if ip in device_info:
+                devices[ip]["device_info"] = device_info[ip]
 
     data = {"last_updated": now_str, "devices": devices}
     tmp = STATUS_FILE + ".tmp"
@@ -129,7 +133,10 @@ def load_status(ips: list[str]) -> None:
             hostname = entry.get("hostname", "")
             if hostname:
                 hostnames[ip] = hostname
-            msgs.append(f"  {ip:<20}  {hostname:<30}  {label} (skipping)")
+            saved_info = entry.get("device_info")
+            if saved_info:
+                device_info[ip] = saved_info
+            msgs.append(f"  {ip:<20}  {hostname:<28}  {label} (skipping)")
 
         elif status == "retry":
             retry_until = entry.get("retry_until", 0.0)
@@ -184,10 +191,11 @@ def parse_sdwan_versions(output: str) -> dict:
     return versions
 
 
-def log(ip: str, msg: str) -> None:
+def log(ip: str, msg: str, console: bool = False) -> None:
     line = f"[{ts()}] [{ip}] {msg}"
     with print_lock:
-        print(line)
+        if console:
+            print(line)
         if _log_file:
             _log_file.write(line + "\n")
             _log_file.flush()
@@ -304,6 +312,80 @@ def discover_hostname(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClient
     return client
 
 
+def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClient:
+    """
+    Collect CONFIG / POLICY / CIRCUIT status via SSH.
+    Never raises — all fields default to '?' if the command fails.
+    Always re-collects so status stays current.
+    """
+    info = dict(device_info.get(ip, {}))
+    info.setdefault('config',  '?')
+    info.setdefault('policy',  '?')
+    info.setdefault('circuit', '?')
+
+    # ── CONFIG: show sdwan system ─────────────────────────────────────────────
+    try:
+        client, out = run_command(client, ip, "show sdwan system", timeout=SSH_TIMEOUT)
+        log(ip, f"show sdwan system output:\n{out.strip()}")
+        config_status = '?'
+        for line in out.splitlines():
+            lower = line.lower()
+            # Field may appear as 'configuration template', 'config-template', etc.
+            if any(k in lower for k in ('configuration template', 'config-template', 'config template')):
+                # Split on colon or 2+ whitespace, discard empty parts
+                parts = [p.strip() for p in re.split(r':\s*|\s{2,}', line.strip()) if p.strip()]
+                value = parts[-1].lower() if len(parts) >= 2 else ''
+                if value.startswith('onboard'):
+                    config_status = 'REQUIRED'
+                elif value.startswith('type'):
+                    config_status = 'COMPLETE'
+                elif value:
+                    config_status = value[:12]
+                break
+        info['config'] = config_status
+        log(ip, f"CONFIG: {config_status}")
+    except Exception as exc:
+        log(ip, f"CONFIG collect error: {type(exc).__name__}: {exc}")
+
+    # ── POLICY: show utd engine standard config ───────────────────────────────
+    try:
+        client, out = run_command(client, ip, "show utd engine standard config", timeout=SSH_TIMEOUT)
+        log(ip, f"show utd engine standard config output:\n{out.strip()}")
+        policy_status = '?'  # stays '?' if Unified Policy line not found
+        for line in out.splitlines():
+            if 'unified policy' in line.lower():
+                parts = [p.strip() for p in re.split(r':\s*|\s{2,}', line.strip()) if p.strip()]
+                value = parts[-1] if len(parts) >= 2 else ''
+                policy_status = 'COMPLETE' if value.lower() == 'enabled' else 'REQUIRED'
+                break
+        info['policy'] = policy_status
+        log(ip, f"POLICY: {policy_status}")
+    except Exception as exc:
+        log(ip, f"POLICY collect error: {type(exc).__name__}: {exc}")
+
+    # ── CIRCUIT: show ip interface brief ─────────────────────────────────────
+    try:
+        client, out = run_command(client, ip, "show ip interface brief", timeout=SSH_TIMEOUT)
+        log(ip, f"show ip interface brief output:\n{out.strip()}")
+        circuit_status = 'NOT CONNECTED'
+        ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and parts[0].lower() == 'dialer1':
+                if len(parts) >= 2 and ip_pattern.match(parts[1]):
+                    circuit_status = 'CONNECTED'
+                break
+        info['circuit'] = circuit_status
+        log(ip, f"CIRCUIT: {circuit_status}")
+    except Exception as exc:
+        log(ip, f"CIRCUIT collect error: {type(exc).__name__}: {exc}")
+
+    with state_lock:
+        device_info[ip] = info
+    save_status()
+    return client
+
+
 def run_command(client: paramiko.SSHClient, ip: str, command: str,
                 timeout: int = CMD_TIMEOUT) -> tuple[paramiko.SSHClient, str]:
     """
@@ -367,14 +449,21 @@ def upgrade_device(ip: str) -> None:
     log(ip, "=== Starting upgrade workflow ===")
 
     def fail(reason: str) -> None:
-        log(ip, f"FAILED: {reason} — queuing for retry in 5 minutes")
+        log(ip, f"FAILED: {reason} — queuing for retry in 5 minutes", console=True)
         with state_lock:
             checking.discard(ip)
             checking_since.pop(ip, None)
             in_progress.discard(ip)
             in_progress_since.pop(ip, None)
+            in_progress_step.pop(ip, None)
             retry_queue[ip] = time.time() + RETRY_DELAY
         save_status()
+
+    def set_step(label: str) -> None:
+        """Update the displayed upgrade step for this device."""
+        with state_lock:
+            in_progress_step[ip] = label
+        log(ip, label, console=True)
 
     # ── Step 1: SSH connect ────────────────────────────────────────────────────
     try:
@@ -385,7 +474,7 @@ def upgrade_device(ip: str) -> None:
 
     try:
         # ── Step 2: Parse version table ───────────────────────────────────────
-        # Discover hostname first (uses run_command — safe for IOS-XE)
+        # Discover hostname (uses run_command — safe for IOS-XE)
         if ip not in hostnames:
             client = discover_hostname(client, ip)
 
@@ -415,18 +504,19 @@ def upgrade_device(ip: str) -> None:
             checking_since.pop(ip, None)
             in_progress.add(ip)
             in_progress_since[ip] = time.time()
+            in_progress_step[ip] = "INSTALLING"
         save_status()
 
         if is_active and not is_default:
             # Active but set-default / remove not yet done — jump to step 7
-            log(ip, f"{TARGET_VERSION} is active but not default — resuming at set-default")
+            log(ip, f"{TARGET_VERSION} is active but not default — resuming at set-default", console=True)
 
         elif is_installed and not is_active:
             # Installed but activate not yet done — jump to step 5
-            log(ip, f"{TARGET_VERSION} is installed but not active — resuming at activate")
+            log(ip, f"{TARGET_VERSION} is installed but not active — resuming at activate", console=True)
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
-            log(ip, f"Activating {TARGET_VERSION} (device will reboot)…")
+            set_step("ACTIVATING")
             activate_cmd = (
                 f"request platform software sdwan software activate {TARGET_VERSION}"
             )
@@ -474,7 +564,7 @@ def upgrade_device(ip: str) -> None:
                 log(ip, "Install file found on bootflash")
 
                 # ── Step 4: Install ───────────────────────────────────────────
-                log(ip, "Installing software (this may take several minutes)…")
+                set_step("INSTALLING")
                 install_cmd = (
                     f"request platform software sdwan software install {INSTALL_FILE}"
                 )
@@ -486,7 +576,7 @@ def upgrade_device(ip: str) -> None:
                     return
 
             # ── Step 5: Activate (triggers reboot) ────────────────────────────
-            log(ip, f"Activating {TARGET_VERSION} (device will reboot)…")
+            set_step("ACTIVATING")
             activate_cmd = (
                 f"request platform software sdwan software activate {TARGET_VERSION}"
             )
@@ -496,18 +586,20 @@ def upgrade_device(ip: str) -> None:
                 )
                 log(ip, f"Activate output:\n{activate_output.strip()}")
             except Exception:
-                log(ip, "Connection dropped (expected during reboot)")
+                log(ip, "Connection dropped (expected during reboot)", console=True)
             finally:
                 client.close()
 
             # ── Step 6: Wait for reboot ───────────────────────────────────────
+            set_step("ACTIVATING - REBOOTING")
             if not wait_for_reboot(ip):
                 fail("Device did not return after activate reboot")
                 return
-            log(ip, "Waiting 60s for SSH daemon to restart…")
+            log(ip, "Waiting 60s for SSH daemon to restart…", console=True)
             time.sleep(60)
 
         # ── Step 7: Reconnect and set-default ─────────────────────────────────
+        set_step("SETTING DEFAULT")
         log(ip, "Reconnecting for set-default…")
         try:
             client = ssh_connect(ip)
@@ -525,7 +617,7 @@ def upgrade_device(ip: str) -> None:
 
         # ── Step 8: Remove old version ────────────────────────────────────────
         time.sleep(10)
-
+        set_step("REMOVING OLD CODE")
         log(ip, "Reconnecting to remove old software…")
         try:
             client = ssh_connect(ip)
@@ -542,11 +634,12 @@ def upgrade_device(ip: str) -> None:
         client.close()
 
         # ── Done ──────────────────────────────────────────────────────────────
-        log(ip, f"=== UPGRADE COMPLETE — {TARGET_VERSION} active+default ===")
+        log(ip, f"=== CODE UPGRADE COMPLETE — {TARGET_VERSION} active+default ===", console=True)
         with state_lock:
-            completed[ip] = "UPGRADE COMPLETE"
+            completed[ip] = "CODE UPGRADE COMPLETE"
             in_progress.discard(ip)
             in_progress_since.pop(ip, None)
+            in_progress_step.pop(ip, None)
         save_status()
 
     except Exception as exc:
@@ -602,14 +695,50 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
         time.sleep(PING_INTERVAL)
 
 
+def info_collector_loop(ips: list[str]) -> None:
+    """
+    Background thread: every 60 seconds open a fresh SSH connection for each
+    Up device that is missing any device_info field and collect the status.
+    This runs independently of the upgrade workflow so it never interferes.
+    """
+    INFO_INTERVAL = 60
+    while True:
+        with state_lock:
+            candidates = [
+                ip for ip in ips
+                if ip not in in_progress
+                and ip not in checking
+                and (
+                    ip not in device_info
+                    or '?' in device_info[ip].values()
+                    or ip in completed  # always refresh completed devices
+                )
+            ]
+        for ip in candidates:
+            # Skip if clearly down and not yet completed — no point trying SSH
+            with state_lock:
+                is_completed = ip in completed
+                last_ping    = ping_results.get(ip, "Down")
+            if last_ping == "Down" and not is_completed:
+                continue
+            try:
+                client = ssh_connect(ip)
+                if ip not in hostnames:
+                    client = discover_hostname(client, ip)
+                collect_device_info(client, ip)
+                client.close()
+            except Exception as exc:
+                log(ip, f"Info collect SSH error: {type(exc).__name__}: {exc}")
+        time.sleep(INFO_INTERVAL)
+
+
 def print_status(ips: list[str], display_order: list[str], now: float) -> None:
     with print_lock:
-        print(f"\n{'─'*75}")
-        print(f"  {'IP':<20}  {'HOSTNAME':<30}  STATUS")
-        print(f"{'─'*75}")
+        print(f"\n{'─'*125}")
+        print(f"  {'IP':<20}  {'HOSTNAME':<28}  {'CODE STATUS':<30}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<15}")
+        print(f"{'─'*125}")
         for entry in display_order:
             if entry.startswith("#"):
-                # Comment line — display as a section header
                 print(f"  {entry}")
                 continue
             ip = entry
@@ -618,7 +747,8 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                     state = completed[ip]
                 elif ip in in_progress:
                     elapsed = max(0, int(now - in_progress_since.get(ip, now)))
-                    state = f"INSTALLING ({fmt_elapsed(elapsed)})"
+                    step = in_progress_step.get(ip, "INSTALLING")
+                    state = f"{step} ({fmt_elapsed(elapsed)})"
                 elif ip in checking:
                     elapsed = max(0, int(now - checking_since.get(ip, now)))
                     state = f"CHECKING CODE VERSION ({fmt_elapsed(elapsed)})"
@@ -632,8 +762,12 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                         state = f"Up ({held}s / {UP_THRESHOLD}s)"
                     else:
                         state = status
-            print(f"  {ip:<20}  {hostnames.get(ip, ''):<30}  {state}")
-        print(f"{'─'*75}  [{ts()}]\n")
+                info = device_info.get(ip, {})
+                cfg     = info.get('config',  '')
+                policy  = info.get('policy',  '')
+                circuit = info.get('circuit', '')
+            print(f"  {ip:<20}  {hostnames.get(ip, ''):<28}  {state:<30}  {cfg:<10}  {policy:<10}  {circuit:<15}")
+        print(f"{'─'*125}  [{ts()}]\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -660,6 +794,10 @@ def main() -> None:
 
     print(f"Found {len(ips)} target IP(s):\n  " + "\n  ".join(ips))
     print(f"\nMonitoring — upgrade triggers after {UP_THRESHOLD}s continuous uptime\n")
+
+    # Start background info collector
+    t_info = threading.Thread(target=info_collector_loop, args=(ips,), daemon=True)
+    t_info.start()
 
     try:
         ping_loop(ips, display_order)

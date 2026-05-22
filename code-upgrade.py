@@ -129,6 +129,8 @@ def load_status(ips: list[str]) -> None:
 
         if status == "complete":
             label = entry.get("label", "COMPLETE")
+            if label == "CODE UPGRADE COMPLETE":
+                label = "UPGRADE COMPLETE"
             completed[ip] = label
             hostname = entry.get("hostname", "")
             if hostname:
@@ -373,7 +375,7 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
             parts = line.split()
             if parts and parts[0].lower() == 'dialer1':
                 if len(parts) >= 2 and ip_pattern.match(parts[1]):
-                    circuit_status = 'CONNECTED'
+                    circuit_status = f"CONNECTED ({parts[1]})"
                 break
         info['circuit'] = circuit_status
         log(ip, f"CIRCUIT: {circuit_status}")
@@ -634,9 +636,9 @@ def upgrade_device(ip: str) -> None:
         client.close()
 
         # ── Done ──────────────────────────────────────────────────────────────
-        log(ip, f"=== CODE UPGRADE COMPLETE — {TARGET_VERSION} active+default ===", console=True)
+        log(ip, f"=== UPGRADE COMPLETE — {TARGET_VERSION} active+default ===", console=True)
         with state_lock:
-            completed[ip] = "CODE UPGRADE COMPLETE"
+            completed[ip] = "UPGRADE COMPLETE"
             in_progress.discard(ip)
             in_progress_since.pop(ip, None)
             in_progress_step.pop(ip, None)
@@ -712,6 +714,7 @@ def info_collector_loop(ips: list[str]) -> None:
                     ip not in device_info
                     or '?' in device_info[ip].values()
                     or ip in completed  # always refresh completed devices
+                    or device_info.get(ip, {}).get('circuit') == 'CONNECTED'  # old format, no IP
                 )
             ]
         for ip in candidates:
@@ -734,9 +737,9 @@ def info_collector_loop(ips: list[str]) -> None:
 
 def print_status(ips: list[str], display_order: list[str], now: float) -> None:
     with print_lock:
-        print(f"\n{'─'*125}")
-        print(f"  {'IP':<20}  {'HOSTNAME':<28}  {'CODE STATUS':<30}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<15}")
-        print(f"{'─'*125}")
+        print(f"\n{'─'*138}")
+        print(f"  {'IP':<20}  {'HOSTNAME':<28}  {'CODE STATUS':<30}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<28}")
+        print(f"{'─'*138}")
         for entry in display_order:
             if entry.startswith("#"):
                 print(f"  {entry}")
@@ -766,8 +769,8 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                 cfg     = info.get('config',  '')
                 policy  = info.get('policy',  '')
                 circuit = info.get('circuit', '')
-            print(f"  {ip:<20}  {hostnames.get(ip, ''):<28}  {state:<30}  {cfg:<10}  {policy:<10}  {circuit:<15}")
-        print(f"{'─'*125}  [{ts()}]\n")
+            print(f"  {ip:<20}  {hostnames.get(ip, ''):<28}  {state:<30}  {cfg:<10}  {policy:<10}  {circuit:<28}")
+        print(f"{'─'*138}  [{ts()}]\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

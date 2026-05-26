@@ -52,6 +52,10 @@ in_progress_step:  dict[str, str]  = {}        # ip -> current upgrade step labe
 retry_queue:  dict[str, float]  = {}          # ip -> epoch when retry is due
 hostnames:    dict[str, str]    = {}          # ip -> discovered hostname
 device_info:  dict[str, dict]  = {}          # ip -> {config, policy, circuit}
+ping_miss_count:      dict[str, int]  = {}   # ip -> consecutive missed pings
+ping_hit_count:       dict[str, int]  = {}   # ip -> consecutive successful pings
+circuit_ping_offline: set[str]        = set() # completed IPs offline per ping tracking
+wan_ip_cache:         dict[str, str]  = {}   # ip -> last known WAN/Dialer1 IP
 state_lock    = threading.Lock()
 print_lock    = threading.Lock()
 _log_file     = None   # opened in main()
@@ -376,6 +380,7 @@ def collect_device_info(client: paramiko.SSHClient, ip: str) -> paramiko.SSHClie
             if parts and parts[0].lower() == 'dialer1':
                 if len(parts) >= 2 and ip_pattern.match(parts[1]):
                     circuit_status = f"CONNECTED ({parts[1]})"
+                    wan_ip_cache[ip] = parts[1]   # retain WAN IP for OFFLINE display
                 break
         info['circuit'] = circuit_status
         log(ip, f"CIRCUIT: {circuit_status}")
@@ -669,8 +674,10 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
 
         for ip in ips:
             with state_lock:
-                if ip in completed or ip in in_progress or ip in checking:
-                    continue
+                is_completed = ip in completed
+                skip = not is_completed and (ip in in_progress or ip in checking)
+            if skip:
+                continue
 
             up = ping_once(ip)
 
@@ -678,19 +685,34 @@ def ping_loop(ips: list[str], display_order: list[str]) -> None:
                 was_up = ping_results.get(ip) == "Up"
                 ping_results[ip] = "Up" if up else "Down"
 
-                if up:
-                    if not was_up:
-                        up_since[ip] = now
-                    elif now - up_since.get(ip, now) >= UP_THRESHOLD:
-                        if ip not in checking and ip not in in_progress and ip not in completed:
-                            checking.add(ip)
-                            checking_since[ip] = now
-                            t = threading.Thread(
-                                target=upgrade_device, args=(ip,), daemon=True
-                            )
-                            t.start()
+                if is_completed:
+                    # Track consecutive misses/hits to detect circuit going offline
+                    if up:
+                        ping_miss_count[ip] = 0
+                        ping_hit_count[ip] = ping_hit_count.get(ip, 0) + 1
+                        if ip in circuit_ping_offline and ping_hit_count[ip] >= 2:
+                            circuit_ping_offline.discard(ip)
+                            log(ip, "Circuit back ONLINE (2 consecutive pings)", console=True)
+                    else:
+                        ping_hit_count[ip] = 0
+                        ping_miss_count[ip] = ping_miss_count.get(ip, 0) + 1
+                        if ping_miss_count[ip] >= 3 and ip not in circuit_ping_offline:
+                            circuit_ping_offline.add(ip)
+                            log(ip, "Circuit marked OFFLINE (3 consecutive missed pings)", console=True)
                 else:
-                    up_since.pop(ip, None)
+                    if up:
+                        if not was_up:
+                            up_since[ip] = now
+                        elif now - up_since.get(ip, now) >= UP_THRESHOLD:
+                            if ip not in checking and ip not in in_progress and ip not in completed:
+                                checking.add(ip)
+                                checking_since[ip] = now
+                                t = threading.Thread(
+                                    target=upgrade_device, args=(ip,), daemon=True
+                                )
+                                t.start()
+                    else:
+                        up_since.pop(ip, None)
 
         # Print status summary
         print_status(ips, display_order, now)
@@ -718,11 +740,11 @@ def info_collector_loop(ips: list[str]) -> None:
                 )
             ]
         for ip in candidates:
-            # Skip if clearly down and not yet completed — no point trying SSH
+            # Skip if down — SSH will fail; no point trying
             with state_lock:
                 is_completed = ip in completed
                 last_ping    = ping_results.get(ip, "Down")
-            if last_ping == "Down" and not is_completed:
+            if last_ping == "Down":
                 continue
             try:
                 client = ssh_connect(ip)
@@ -737,9 +759,9 @@ def info_collector_loop(ips: list[str]) -> None:
 
 def print_status(ips: list[str], display_order: list[str], now: float) -> None:
     with print_lock:
-        print(f"\n{'─'*138}")
-        print(f"  {'IP':<20}  {'HOSTNAME':<28}  {'CODE STATUS':<30}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<28}")
-        print(f"{'─'*138}")
+        print(f"\n{'─'*142}")
+        print(f"  {'IP':<20}  {'HOSTNAME':<28}  {'CODE STATUS':<34}  {'CONFIG':<10}  {'POLICY':<10}  {'CIRCUIT':<28}")
+        print(f"{'─'*142}")
         for entry in display_order:
             if entry.startswith("#"):
                 print(f"  {entry}")
@@ -768,9 +790,13 @@ def print_status(ips: list[str], display_order: list[str], now: float) -> None:
                 info = device_info.get(ip, {})
                 cfg     = info.get('config',  '')
                 policy  = info.get('policy',  '')
-                circuit = info.get('circuit', '')
-            print(f"  {ip:<20}  {hostnames.get(ip, ''):<28}  {state:<30}  {cfg:<10}  {policy:<10}  {circuit:<28}")
-        print(f"{'─'*138}  [{ts()}]\n")
+                if ip in circuit_ping_offline:
+                    wan_ip  = wan_ip_cache.get(ip, '')
+                    circuit = f"OFFLINE ({wan_ip})" if wan_ip else "OFFLINE"
+                else:
+                    circuit = info.get('circuit', '')
+            print(f"  {ip:<20}  {hostnames.get(ip, ''):<28}  {state:<34}  {cfg:<10}  {policy:<10}  {circuit:<28}")
+        print(f"{'─'*142}  [{ts()}]\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
